@@ -6,11 +6,13 @@ import time
 import logging
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
-import telegram
-from telegram.constants import ParseMode
-import threading
 import pytz
 import warnings
+from dotenv import load_dotenv
+import asyncio
+from telegram import Bot, ParseMode
+
+load_dotenv()
 
 # تجاهل تحذيرات pkg_resources المؤقتة
 warnings.filterwarnings("ignore", category=UserWarning, message="pkg_resources is deprecated")
@@ -28,7 +30,7 @@ MAX_OPEN_TRADES = 1  # صفقة واحدة مفتوحة لكل زوج
 CONNECTION_RETRY_DELAY = 10  # ثواني بين محاولات إعادة الاتصال
 
 class TradingMonitor:
-    def __init__(self, is_headless=False):
+    def __init__(self, is_headless=True):  # تغيير الافتراضي إلى True ليعمل على Render
         self.performance_log = pd.DataFrame(columns=['symbol', 'signal', 'price', 'time'])
         self.orders_log = pd.DataFrame(columns=['symbol', 'side', 'price', 'amount', 'timestamp'])
         self.indicators_data = {}
@@ -37,6 +39,8 @@ class TradingMonitor:
         self.client = None
         self.is_headless = is_headless
         self.last_connection_attempt = 0
+        self.loop = None
+        self.tg_bot = None
         
         # إعداد التسجيل
         logging.basicConfig(
@@ -51,24 +55,35 @@ class TradingMonitor:
         # إعداد بوت التليجرام إذا كانت المفاتيح متوفرة
         if hasattr(self, 'telegram_token') and hasattr(self, 'telegram_chat_id'):
             try:
-                self.tg_bot = telegram.Bot(token=self.telegram_token)
-                self.log_message("Telegram bot initialized successfully")
-            except Exception as e:
-                self.log_message(f"Failed to initialize Telegram bot: {str(e)}", "error")
-        else:
-            self.log_message("Telegram credentials missing. Notifications disabled.", "warning")
-                
-        if hasattr(self, 'tg_bot'):
-            try:
-                self.tg_bot.send_message(
-                    chat_id=self.telegram_chat_id,
-                    text="✅ Bot started successfully!\n"
-                         f"📅 Next report at: 23:00 (UTC)\n"
-                         f"🔍 Monitoring: {len(SYMBOLS)} symbols",
-                    parse_mode=ParseMode.MARKDOWN_V2
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                self.tg_bot = Bot(token=self.telegram_token)
+                self.send_telegram_message(
+                    "✅ Bot started successfully!\n"
+                    f"📅 Next report at: 23:00 (UTC)\n"
+                    f"🔍 Monitoring: {len(SYMBOLS)} symbols"
                 )
             except Exception as e:
-                self.log_message(f"Failed to send startup message to Telegram: {str(e)}", "error")
+                self.log_message(f"Failed to initialize Telegram bot: {str(e)}", "error")
+                
+    def send_telegram_message(self, text):
+        if not hasattr(self, 'tg_bot') or not self.tg_bot:
+            return
+            
+        try:
+            async def send():
+                await self.tg_bot.send_message(
+                    chat_id=self.telegram_chat_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+            
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(send(), self.loop)
+            else:
+                self.loop.run_until_complete(send())
+        except Exception as e:
+            self.log_message(f"Failed to send Telegram message: {str(e)}", "error")
     
     def load_api_keys(self):
         try:
@@ -125,21 +140,17 @@ class TradingMonitor:
             logging.info(message)
             
     def setup_daily_report(self):
-        """جدولة التقرير اليومي"""
-        try:
-            self.scheduler = BackgroundScheduler(timezone=pytz.UTC)
-            self.scheduler.add_job(
-                self.send_daily_report,
-                'cron',
-                hour=23,
-                minute=0,
-                timezone=pytz.UTC
-            )
-            self.scheduler.start()
-            self.log_message("Daily report scheduler started")
-        except Exception as e:
-            self.log_message(f"Scheduler error: {str(e)}", "error")
-
+        """إعداد جدول التقرير اليومي"""
+        self.scheduler = BackgroundScheduler(timezone=pytz.UTC)
+        self.scheduler.add_job(
+            self.send_daily_report,
+            'cron',
+            hour=23,
+            minute=0,
+            timezone=pytz.UTC
+        )
+        self.scheduler.start()
+            
     def send_daily_report(self):
         """إرسال التقرير اليومي على Telegram"""
         if not hasattr(self, 'tg_bot'):
@@ -156,11 +167,8 @@ class TradingMonitor:
             
             report = self.generate_report_text(today_signals, completed_orders, profit_loss)
             
-            self.tg_bot.send_message(
-                chat_id=self.telegram_chat_id,
-                text=report,
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
+            self.send_telegram_message(report)
+            
             self.log_message("Daily report sent to Telegram")
         except Exception as e:
             self.log_message(f"Error sending daily report: {str(e)}", "error")
@@ -390,31 +398,25 @@ ${profit_loss:.2f} {'✅' if profit_loss >= 0 else '❌'}
             if not self.coinex_connected:
                 self.connect_coinex()
             
-            # استخدام threading فقط في الوضع العادي
-            if not self.is_headless:
-                monitor_thread = threading.Thread(target=self.monitoring_loop, daemon=True)
-                monitor_thread.start()
-            else:
-                self.monitoring_loop()
+            # في Render، نستخدم الوضع headless مباشرة
+            self.monitoring_loop()
         
     def stop_monitoring(self):
         self.is_running = False
         self.log_message("Monitoring stopped")
         if hasattr(self, 'scheduler'):
             self.scheduler.shutdown()
-
+        if hasattr(self, 'loop'):
+            self.loop.close()
 
 if __name__ == "__main__":
+    # على Render، سيتم تشغيله كخدمة مستمرة
+    monitor = TradingMonitor(is_headless=True)
+    monitor.start_monitoring()
+    
+    # الحفاظ على التشغيل باستخدام حلقة لا نهائية
     try:
-        monitor = TradingMonitor(is_headless=False)
-        monitor.start_monitoring()
-        
-        # حلقة انتظار للسماح للبرنامج بالاستمرار
         while True:
             time.sleep(1)
-            
     except KeyboardInterrupt:
         monitor.stop_monitoring()
-        print("\nBot stopped by user")
-    except Exception as e:
-        print(f"Fatal error: {str(e)}")
