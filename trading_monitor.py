@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-import ta  # تم استبدال talib بـ ta
+import ta
 import ccxt
 import time
 import logging
@@ -9,7 +9,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import telegram
 from telegram.constants import ParseMode
 import threading
+import pytz
+import warnings
 
+# تجاهل تحذيرات pkg_resources المؤقتة
+warnings.filterwarnings("ignore", category=UserWarning, message="pkg_resources is deprecated")
 
 # إعدادات الاستراتيجية
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'ADA/USDT', 'DOGE/USDT']
@@ -21,6 +25,7 @@ RSI_OVERBOUGHT = 65
 RSI_OVERSOLD = 35
 TRADE_SIZE = 9  # دولار لكل صفقة
 MAX_OPEN_TRADES = 1  # صفقة واحدة مفتوحة لكل زوج
+CONNECTION_RETRY_DELAY = 10  # ثواني بين محاولات إعادة الاتصال
 
 class TradingMonitor:
     def __init__(self, is_headless=False):
@@ -31,6 +36,7 @@ class TradingMonitor:
         self.coinex_connected = False
         self.client = None
         self.is_headless = is_headless
+        self.last_connection_attempt = 0
         
         # إعداد التسجيل
         logging.basicConfig(
@@ -49,16 +55,20 @@ class TradingMonitor:
                 self.log_message("Telegram bot initialized successfully")
             except Exception as e:
                 self.log_message(f"Failed to initialize Telegram bot: {str(e)}", "error")
+        else:
+            self.log_message("Telegram credentials missing. Notifications disabled.", "warning")
                 
-        # في ملف trading_monitor.py داخل دالة __init__
         if hasattr(self, 'tg_bot'):
-            self.tg_bot.send_message(
-                chat_id=self.telegram_chat_id,
-                text="✅ Bot started successfully!\n"
-                     f"📅 Next report at: 23:00 (UTC)\n"
-                     f"🔍 Monitoring: {len(SYMBOLS)} symbols",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
+            try:
+                self.tg_bot.send_message(
+                    chat_id=self.telegram_chat_id,
+                    text="✅ Bot started successfully!\n"
+                         f"📅 Next report at: 23:00 (UTC)\n"
+                         f"🔍 Monitoring: {len(SYMBOLS)} symbols",
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+            except Exception as e:
+                self.log_message(f"Failed to send startup message to Telegram: {str(e)}", "error")
     
     def load_api_keys(self):
         try:
@@ -68,15 +78,25 @@ class TradingMonitor:
             self.telegram_token = os.getenv('TELEGRAM_TOKEN')
             self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
             
+            if not self.access_id or not self.secret_key:
+                self.log_message("CoinEx API keys not found in environment variables", "warning")
+            
         except Exception as e:
             self.log_message(f"Error loading environment variables: {str(e)}", "error")
     
     def connect_coinex(self):
         if not self.access_id or not self.secret_key:
             self.log_message("CoinEx API keys not found", "error")
-            return
+            return False
     
         try:
+            # منع محاولات الاتصال المتكررة السريعة
+            current_time = time.time()
+            if current_time - self.last_connection_attempt < 30:
+                return False
+                
+            self.last_connection_attempt = current_time
+            
             self.client = ccxt.coinex({
                 'apiKey': self.access_id,
                 'secret': self.secret_key,
@@ -88,10 +108,12 @@ class TradingMonitor:
             self.client.fetch_balance()
             self.coinex_connected = True
             self.log_message("Successfully connected to CoinEx")
+            return True
         
         except Exception as e:
             self.coinex_connected = False
             self.log_message(f"Failed to connect to CoinEx: {str(e)}", "error")
+            return False
     
     def log_message(self, message, level="info"):
         """إضافة رسالة إلى السجل"""
@@ -104,19 +126,19 @@ class TradingMonitor:
             
     def setup_daily_report(self):
         """جدولة التقرير اليومي"""
-        import pytz  # أضف هذا الاستيراد في أعلى الملف
-    
-        self.scheduler = BackgroundScheduler(timezone=pytz.UTC)  # تحديد المنطقة الزمنية
-    
-        self.scheduler.add_job(
-            self.send_daily_report,
-            'cron',
-            hour=23,
-            minute=0,
-            timezone=pytz.UTC  # تحديد المنطقة الزمنية هنا أيضاً
-        )
-        self.scheduler.start()
-        self.log_message("Daily report scheduler started")
+        try:
+            self.scheduler = BackgroundScheduler(timezone=pytz.UTC)
+            self.scheduler.add_job(
+                self.send_daily_report,
+                'cron',
+                hour=23,
+                minute=0,
+                timezone=pytz.UTC
+            )
+            self.scheduler.start()
+            self.log_message("Daily report scheduler started")
+        except Exception as e:
+            self.log_message(f"Scheduler error: {str(e)}", "error")
 
     def send_daily_report(self):
         """إرسال التقرير اليومي على Telegram"""
@@ -205,9 +227,8 @@ ${profit_loss:.2f} {'✅' if profit_loss >= 0 else '❌'}
         
     def analyze_symbol(self, symbol):
         if not self.coinex_connected:
-            self.connect_coinex()  # محاولة إعادة الاتصال
-            if not self.coinex_connected:
-                self.log_message("Cannot analyze symbol - not connected to CoinEx", "warning")
+            if not self.connect_coinex():
+                self.log_message(f"Skipping {symbol} analysis - not connected to CoinEx", "warning")
                 return
         
         try:
@@ -314,6 +335,17 @@ ${profit_loss:.2f} {'✅' if profit_loss >= 0 else '❌'}
             )
         
             self.log_message(f"Placed {side} order for {symbol} | Amount: {amount:.6f} | Price: {price:.4f}")
+            
+            # تسجيل الطلب
+            order_data = {
+                'symbol': symbol,
+                'side': side,
+                'price': price,
+                'amount': amount,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            self.orders_log = pd.concat([self.orders_log, pd.DataFrame([order_data])], ignore_index=True)
+            
             return True
         
         except Exception as e:
@@ -323,23 +355,31 @@ ${profit_loss:.2f} {'✅' if profit_loss >= 0 else '❌'}
             return False
     
     def monitoring_loop(self):
-        while self.is_running:
-            self.log_message("\n" + "="*40)
-            self.log_message("Starting new market scan")
-            
-            # الاتصال إذا لم يكن متصلاً
-            if not self.coinex_connected:
-                self.connect_coinex()
-            
-            for symbol in SYMBOLS:
-                if not self.is_running:
-                    break
+        try:
+            while self.is_running:
+                self.log_message("\n" + "="*40)
+                self.log_message("Starting new market scan")
                 
-                self.analyze_symbol(symbol)
-                time.sleep(1)
-            
-            if self.is_running:
-                time.sleep(300)
+                # الاتصال إذا لم يكن متصلاً
+                if not self.coinex_connected:
+                    if not self.connect_coinex():
+                        self.log_message(f"Waiting {CONNECTION_RETRY_DELAY} seconds before retrying...", "warning")
+                        time.sleep(CONNECTION_RETRY_DELAY)
+                        continue
+                
+                for symbol in SYMBOLS:
+                    if not self.is_running:
+                        break
+                    
+                    self.analyze_symbol(symbol)
+                    time.sleep(1)  # تجنب rate limits
+                
+                if self.is_running:
+                    time.sleep(300)  # انتظر 5 دقائق بين كل مسح
+                    
+        except Exception as e:
+            self.log_message(f"Critical error in monitoring_loop: {str(e)}", "error")
+            self.is_running = False
                 
     def start_monitoring(self):
         if not self.is_running:
@@ -360,3 +400,21 @@ ${profit_loss:.2f} {'✅' if profit_loss >= 0 else '❌'}
     def stop_monitoring(self):
         self.is_running = False
         self.log_message("Monitoring stopped")
+        if hasattr(self, 'scheduler'):
+            self.scheduler.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        monitor = TradingMonitor(is_headless=False)
+        monitor.start_monitoring()
+        
+        # حلقة انتظار للسماح للبرنامج بالاستمرار
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        monitor.stop_monitoring()
+        print("\nBot stopped by user")
+    except Exception as e:
+        print(f"Fatal error: {str(e)}")
