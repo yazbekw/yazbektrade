@@ -1,9 +1,8 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
 setup(
     name="crypto-bot",
     version="0.1",
-    packages=find_packages(),
     install_requires=[
         'ccxt==4.2.85',
         'pandas==1.5.3',
@@ -13,6 +12,6 @@ setup(
         'APScheduler==3.10.1',
         'python-telegram-bot==20.6',
         'python-dotenv==1.0.0',
-    ],
-    python_requires='>=3.10',
+        'pytz==2023.3'
+    ]
 )
