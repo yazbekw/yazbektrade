@@ -30,7 +30,7 @@ MAX_OPEN_TRADES = 1  # صفقة واحدة مفتوحة لكل زوج
 CONNECTION_RETRY_DELAY = 10  # ثواني بين محاولات إعادة الاتصال
 
 class TradingMonitor:
-    def __init__(self, is_headless=True):  # تغيير الافتراضي إلى True ليعمل على Render
+    def __init__(self, is_headless=True):
         self.performance_log = pd.DataFrame(columns=['symbol', 'signal', 'price', 'time'])
         self.orders_log = pd.DataFrame(columns=['symbol', 'side', 'price', 'amount', 'timestamp'])
         self.indicators_data = {}
@@ -65,26 +65,17 @@ class TradingMonitor:
                 )
             except Exception as e:
                 self.log_message(f"Failed to initialize Telegram bot: {str(e)}", "error")
-                
-    def send_telegram_message(self, text):
-        if not hasattr(self, 'tg_bot') or not self.tg_bot:
-            return
-            
+
+    async def send_telegram_message(self, text):
         try:
-            async def send():
+            if hasattr(self, 'tg_bot') and self.tg_bot:
                 await self.tg_bot.send_message(
                     chat_id=self.telegram_chat_id,
                     text=text,
                     parse_mode=ParseMode.MARKDOWN_V2
                 )
-            
-            if self.loop and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(send(), self.loop)
-            else:
-                self.loop.run_until_complete(send())
         except Exception as e:
             self.log_message(f"Failed to send Telegram message: {str(e)}", "error")
-    
     def load_api_keys(self):
         try:
             # تحميل المفاتيح من متغيرات البيئة
@@ -388,19 +379,7 @@ ${profit_loss:.2f} {'✅' if profit_loss >= 0 else '❌'}
         except Exception as e:
             self.log_message(f"Critical error in monitoring_loop: {str(e)}", "error")
             self.is_running = False
-                
-    def start_monitoring(self):
-        if not self.is_running:
-            self.is_running = True
-            self.log_message("Monitoring started...")
-            
-            # الاتصال بالبورصة
-            if not self.coinex_connected:
-                self.connect_coinex()
-            
-            # في Render، نستخدم الوضع headless مباشرة
-            self.monitoring_loop()
-        
+
     def stop_monitoring(self):
         self.is_running = False
         self.log_message("Monitoring stopped")
